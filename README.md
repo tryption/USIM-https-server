@@ -1,5 +1,12 @@
 # USIM https server API for AKA authentication
 
+
+## FORK
+This is a fork, which aims to provide the following additional functionality:
+- Caching of AKA Auth responses
+- PIN as command line argument
+- Note that the Modem support was not tested
+
 This is just a basic https server with an API that exposes IMSI, and AKA algorithm to external clients needing that information.
 
 This allow a remote client to be "USIMless", and retrieve IMSI, and RES, CK and IK remotely.
@@ -9,10 +16,6 @@ This is just an example without any authentication/authorization mechanism, but 
 Some applications that I've done that need a dongle or a smartcard reader (eNB, SWu emulator, GBA, etc...), can be adapted to retrieve authentication information through this web service.
 
 I can imagine a usecase: this service running in my Raspberry Pi with a smartcard reader connected to it with my USIM datacard, and I, somewhere in the world with my laptop, using a wifi network to connect to my operator ePDG without any physical USIM card to activate a corporate APN.
-
-The next picture sums it all:
-
-<p align="center"><img src="images/usim-https-server.png" width="100%"></p>
 
 
 So the API has two basic operations, and returns the information in json format:

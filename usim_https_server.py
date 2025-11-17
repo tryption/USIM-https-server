@@ -37,16 +37,61 @@ from urllib.parse import urlsplit, parse_qs
 from functools import partial
 from smartcard.System import readers
 from smartcard.util import toHexString,toBytes
+from pathlib import Path
 
-#path for the server.pem file:
-PATH = '/home/user/https/server.pem'
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from datetime import datetime, timedelta
+
+def create_self_signed_pem(path="server.pem"):
+    key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048
+    )
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, "CH"),
+        x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.utcnow())
+        .not_valid_after(datetime.utcnow() + timedelta(days=365))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName("localhost")]),
+            critical=False
+        )
+        .sign(key, hashes.SHA256())
+    )
+    key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    cert_pem = cert.public_bytes(
+        encoding=serialization.Encoding.PEM
+    )
+
+    Path(path).write_bytes(key_pem + cert_pem)
+
+    return path
+
+cert_path = Path.cwd() / "server.pem"
 
 
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
 
-    def __init__(self, modem, reader, *args, **kwargs):
+    def __init__(self, modem, reader, pin, disable_cache, *args, **kwargs):
         self.modem = modem
         self.reader = reader
+        self.pin = pin
+        self.disable_cache = disable_cache
+        self.auth_cache = {}
         # BaseHTTPRequestHandler calls do_GET **inside** __init__ !!!
         # So we have to call super().__init__ after setting attributes.
         super().__init__(*args, **kwargs)
@@ -76,15 +121,19 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         try:
             params = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
             if params['type'] == 'imsi':
-                imsi = return_imsi(self.modem, self.reader)
+                imsi = return_imsi(self.modem, self.reader, self.pin)
                 message = json.dumps({'imsi': imsi}, indent = "\t")
                 self.API_Ok(message)
             elif params['type'] == 'rand-autn':
                 rand = params['rand']
                 autn = params['autn']
-                res, ck, ik = return_res_ck_ik(self.modem, self.reader, rand, autn)
-                message = json.dumps({'res': res, 'ck': ck, 'ik': ik}, indent = "\t")
-                self.API_Ok(message)
+                if (rand,autn) in self.auth_cache.keys() and not self.disable_cache:
+                    self.API_Ok(self.auth_cache[(rand,autn)])
+                else:
+                    res, ck, ik = return_res_ck_ik(self.modem, self.reader, rand, autn, self.pin)
+                    message = json.dumps({'res': res, 'ck': ck, 'ik': ik}, indent = "\t")
+                    self.auth_cache[(rand,autn)] = message
+                    self.API_Ok(message)
             else:
                 self.API_Error(501, "Error")             
         except:
@@ -92,17 +141,17 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
         
 
 #abstraction functions
-def return_imsi(serial_interface, reader_index):
+def return_imsi(serial_interface, reader_index, pin):
     if serial_interface is not None:
         return get_imsi(serial_interface)
     else:
-        return read_imsi(reader_index)
+        return read_imsi(reader_index, pin)
         
-def return_res_ck_ik(serial_interface, reader_index, rand, autn):
+def return_res_ck_ik(serial_interface, reader_index, rand, autn, pin):
     if serial_interface is not None:
         return get_res_ck_ik(serial_interface, rand, autn)
     else:
-        return read_res_ck_ik(reader_index, rand, autn)
+        return read_res_ck_ik(reader_index, rand, autn, pin)
         
 #modem functions
 def get_imsi(serial_interface):
@@ -189,33 +238,41 @@ def bcd(chars):
         bcd_string += chars[1+2*i] + chars[2*i]
     return bcd_string
 
-def read_imsi(reader_index):
+def transceive_apdu(connection, hex_apdu):
+    data, sw1, sw2 = connection.transmit(toBytes(hex_apdu))
+    result = toHexString(data).replace(" ","")
+    print("APDU: C:%s R:%s SW:%02x%02x" % (hex_apdu, result,sw1,sw2))
+    return result, sw1, sw2
+    
+    
+def read_imsi(reader_index, pin):
     imsi = None
     r = readers()
     connection = r[int(reader_index)].createConnection()
     connection.connect()
-    data, sw1, sw2 = connection.transmit(toBytes('00A40000023F00'))     
-    data, sw1, sw2 = connection.transmit(toBytes('00A40000027F20'))
-    data, sw1, sw2 = connection.transmit(toBytes('00A40000026F07'))
-    data, sw1, sw2 = connection.transmit(toBytes('00B0000009'))  
-    result = toHexString(data).replace(" ","")
-    imsi = bcd(result)[-15:]
+    
+    data, sw1, sw2 = connection.transmit([0, 32, 0, 1, 8, ord(pin[0]),ord(pin[1]),ord(pin[2]),ord(pin[3]), 255, 255, 255, 255])     # PIN
+    data, sw1, sw2 = transceive_apdu(connection, '00A40004023F00')
+    data, sw1, sw2 = transceive_apdu(connection, '00A40004027F20')
+    data, sw1, sw2 = transceive_apdu(connection, '00A40004026F07')
+    data, sw1, sw2 = transceive_apdu(connection, '00B0000009')
+    imsi = bcd(data)[-15:]
     
     return imsi
 
-def read_res_ck_ik(reader_index, rand, autn):
+
+def read_res_ck_ik(reader_index, rand, autn, pin):
     res = None
     ck = None
     ik = None
     r = readers()
     connection = r[int(reader_index)].createConnection()
     connection.connect()
-    data, sw1, sw2 = connection.transmit(toBytes('00A40000023F00'))    
-    data, sw1, sw2 = connection.transmit(toBytes('00A40000022F00')) 
-    data, sw1, sw2 = connection.transmit(toBytes('00A4040010A0000000871002FFFFFFFF8903050001'))   
-    data, sw1, sw2 = connection.transmit(toBytes('008800812210' + rand.upper() + '10' + autn.upper()))   
+    data, sw1, sw2 = connection.transmit([0, 32, 0, 1, 8, ord(pin[0]),ord(pin[1]),ord(pin[2]),ord(pin[3]), 255, 255, 255, 255]) # PIN
+    transceive_apdu(connection, "00A4040007A0000000871002")
+    data, sw1, sw2 = transceive_apdu(connection, '008800812210' + rand.upper() + '10' + autn.upper())   
     if sw1 == 97:
-        data, sw1, sw2 = connection.transmit(toBytes('00C00000') + [sw2])         
+        data, sw1, sw2 = connection.transmit(toBytes('00C00000') + [sw2])    
         result = toHexString(data).replace(" ", "")
         res = result[4:20]
         ck = result[22:54]
@@ -226,17 +283,29 @@ def read_res_ck_ik(reader_index, rand, autn):
 
 
 ####### Main #######
+
+if not cert_path.exists():
+    create_self_signed_pem(cert_path)
+
 parser = OptionParser()    
 parser.add_option("-m", "--modem", dest="modem", help="modem port (i.e. COMX, or /dev/ttyUSBX)") 
-parser.add_option("-r", "--reader", dest="reader", help="reader index (i.e. 0, 1, 2, ...)")  
+parser.add_option("-r", "--reader", dest="reader", help="reader index (i.e. 0, 1, 2, ...)")
+parser.add_option("-p", "--pin", dest="pin", help="PIN code for the card")
+parser.add_option("-d", "--disable_cache", dest="disable_cache", help="Disable the caching of AKA responses")  
 (options, args) = parser.parse_args()
 
-handler = partial(SimpleHTTPRequestHandler, options.modem, options.reader)
+if options.reader is not None and options.pin is None:
+    print("PIN code is not specified! (add with -p)")
+    exit()
+
+handler = partial(SimpleHTTPRequestHandler, options.modem, options.reader, options.pin, options.disable_cache)
 
 httpd = HTTPServer(('', 443), handler)
-httpd.socket = ssl.wrap_socket (httpd.socket,certfile=PATH, server_side=True)
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(certfile=cert_path)
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
 httpd.serve_forever()
 
 # server.pem can be created using the following tool (example for a self signed certificate valid for 365 days):
-# openssl req -new -x509 -keyout server.pem -out server.pem -days 365 -nodes 
+# openssl req -new -x509 -keyout server.pem -out server.pem -days 3650 -nodes 
 
